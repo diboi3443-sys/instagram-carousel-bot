@@ -2,10 +2,10 @@
 """
 Instagram Carousel Generator Bot
 Telegram бот для создания каруселей для Instagram
-Использует OpenRouter API (текст + DALL-E фоны)
+Использует OpenRouter API для AI-текста и AI-фонов, если ключ задан
 """
 
-import os, io, re, json, zipfile, asyncio, logging, tempfile
+import os, io, re, json, zipfile, asyncio, logging, tempfile, base64, hashlib
 from typing import Optional
 from dataclasses import dataclass, field
 from PIL import Image, ImageDraw, ImageFont
@@ -29,7 +29,8 @@ TELEGRAM_TOKEN      = os.getenv("TELEGRAM_TOKEN", "")
 OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 TEXT_MODEL          = os.getenv("TEXT_MODEL", "openai/gpt-4o-mini")
-IMAGE_MODEL         = os.getenv("IMAGE_MODEL", "openai/dall-e-3")
+IMAGE_MODEL         = os.getenv("IMAGE_MODEL", "google/gemini-2.5-flash-image")
+BOT_TITLE           = os.getenv("BOT_TITLE", "Carousel Bot")
 
 SLIDE_W, SLIDE_H = 1080, 1080
 
@@ -84,6 +85,7 @@ class Session:
     bg_c1:          tuple          = (75, 0, 130)
     bg_c2:          Optional[tuple] = (138, 43, 226)
     text_color:     str            = "#FFFFFF"
+    export_format:  str            = "both"
 
 _sessions: dict[int, Session] = {}
 
@@ -102,6 +104,9 @@ def _ensure_fonts() -> dict:
         "regular": os.path.join(_FONT_DIR, "Roboto-Regular.ttf"),
         "bold":    os.path.join(_FONT_DIR, "Roboto-Bold.ttf"),
     }
+    if os.getenv("DOWNLOAD_FONTS", "0") != "1":
+        return paths
+
     # Зеркала шрифтов (несколько на случай недоступности)
     urls = {
         "regular": [
@@ -119,7 +124,9 @@ def _ensure_fonts() -> dict:
             for url in urls[key]:
                 try:
                     logger.info(f"Загружаю шрифт {key} с {url[:50]}...")
-                    urllib.request.urlretrieve(url, path)
+                    with urllib.request.urlopen(url, timeout=8) as resp:
+                        with open(path, "wb") as out:
+                            out.write(resp.read())
                     logger.info(f"Шрифт {key} загружен успешно")
                     break
                 except Exception as e:
@@ -205,6 +212,15 @@ def hex_to_rgb(hex_color: str) -> tuple:
     h = hex_color.lstrip("#")
     return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
 
+def has_ai() -> bool:
+    return bool(OPENROUTER_API_KEY)
+
+def seeded_palette(seed_text: str) -> tuple[tuple, tuple]:
+    digest = hashlib.sha256(seed_text.encode("utf-8")).digest()
+    c1 = (35 + digest[0] % 130, 35 + digest[1] % 130, 35 + digest[2] % 130)
+    c2 = (90 + digest[3] % 140, 90 + digest[4] % 140, 90 + digest[5] % 140)
+    return c1, c2
+
 # ─── Создание слайда ──────────────────────────────────────────────────────────
 def create_slide(
     text: str,
@@ -286,6 +302,9 @@ def _or_client():
     )
 
 async def ai_generate_texts(topic: str, n: int) -> list[str]:
+    if not has_ai():
+        raise RuntimeError("OPENROUTER_API_KEY не задан")
+
     prompt = (
         f'Создай контент для Instagram карусели на тему: "{topic}"\n'
         f"Количество слайдов: {n}\n\n"
@@ -302,36 +321,57 @@ async def ai_generate_texts(topic: str, n: int) -> list[str]:
         max_tokens=700,
         extra_headers={"HTTP-Referer": "https://t.me/carousel_bot", "X-Title": "Carousel Bot"},
     )
-    raw = r.choices[0].message.content
+    raw = r.choices[0].message.content or ""
     m = re.search(r"\{.*\}", raw, re.DOTALL)
     if m:
-        data = json.loads(m.group())
-        return data.get("slides", [])
+        try:
+            data = json.loads(m.group())
+            slides = data.get("slides", [])
+            return [str(x).strip() for x in slides if str(x).strip()]
+        except json.JSONDecodeError:
+            logger.warning("AI вернул невалидный JSON: %s", raw[:300])
     return []
 
 async def ai_generate_bg(prompt: str) -> Optional[bytes]:
+    if not has_ai():
+        return None
+
     full = (
         f"Abstract artistic background for Instagram post, {prompt}, "
         "no text, no letters, square format, high quality, aesthetic, vibrant colors"
     )
     try:
-        r = await _or_client().images.generate(
+        r = await _or_client().chat.completions.create(
             model=IMAGE_MODEL,
-            prompt=full,
-            size="1024x1024",
-            quality="standard",
-            n=1,
+            messages=[{"role": "user", "content": full}],
+            modalities=["image", "text"],
+            extra_headers={"HTTP-Referer": "https://t.me/carousel_bot", "X-Title": BOT_TITLE},
         )
-        url = r.data[0].url
+        msg = r.choices[0].message
+        images = getattr(msg, "images", None) or []
+        if not images:
+            return None
+        first_image = images[0]
+        if isinstance(first_image, dict):
+            image_url = first_image.get("image_url", {}).get("url")
+        else:
+            image_url_obj = getattr(first_image, "image_url", None) or getattr(first_image, "imageUrl", None)
+            image_url = getattr(image_url_obj, "url", None)
+        if not image_url:
+            return None
+        if image_url.startswith("data:image"):
+            _, payload = image_url.split(",", 1)
+            return base64.b64decode(payload)
         async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                return await resp.read()
+            async with session.get(image_url) as resp:
+                if resp.status == 200:
+                    return await resp.read()
     except Exception as e:
         logger.warning(f"AI фон не получился: {e}")
-        return None
+    return None
 
 # ─── Сборка карусели ──────────────────────────────────────────────────────────
-async def build_carousel(s: Session) -> tuple[bytes, bytes]:
+async def build_carousel(s: Session) -> tuple[bytes, bytes, bytes]:
     bg_img, c1, c2 = None, s.bg_c1, s.bg_c2
 
     if s.bg_type == "template":
@@ -342,8 +382,8 @@ async def build_carousel(s: Session) -> tuple[bytes, bytes]:
         if data:
             bg_img = Image.open(io.BytesIO(data))
         else:
-            # fallback на градиент
-            logger.warning("DALL-E недоступен, использую градиент")
+            c1, c2 = seeded_palette(s.bg_prompt)
+            logger.warning("AI фон недоступен, использую уникальный градиент")
     elif s.bg_type == "photo" and s.bg_photo:
         bg_img = Image.open(io.BytesIO(s.bg_photo))
     # bg_type == "color" — c1/c2 уже установлены
@@ -372,6 +412,10 @@ async def build_carousel(s: Session) -> tuple[bytes, bytes]:
             zf.writestr(f"slide_{i+1:02d}.png", buf.getvalue())
     zip_buf.seek(0)
 
+    preview_buf = io.BytesIO()
+    slides[0].save(preview_buf, "JPEG", quality=90)
+    preview_buf.seek(0)
+
     # PDF
     pdf_buf = io.BytesIO()
     c = pdf_canvas.Canvas(pdf_buf, pagesize=(SLIDE_W, SLIDE_H))
@@ -388,7 +432,7 @@ async def build_carousel(s: Session) -> tuple[bytes, bytes]:
     c.save()
     pdf_buf.seek(0)
 
-    return zip_buf.getvalue(), pdf_buf.getvalue()
+    return zip_buf.getvalue(), pdf_buf.getvalue(), preview_buf.getvalue()
 
 # ─── Хелперы клавиатур ────────────────────────────────────────────────────────
 def kb(*rows):
@@ -397,16 +441,27 @@ def kb(*rows):
 def btn(text: str, data: str):
     return InlineKeyboardButton(text, callback_data=data)
 
+def content_keyboard() -> InlineKeyboardMarkup:
+    rows = [[btn("✍️ Введу текст вручную", "ct_manual")]]
+    if has_ai():
+        rows.append([btn("🤖 Сгенерировать через ИИ", "ct_ai")])
+    return kb(*rows)
+
+def bg_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [btn("🖼 Готовые шаблоны (8 стилей)", "bg_template")],
+        [btn("📸 Загрузить своё фото", "bg_photo")],
+        [btn("🎨 Цвет / градиент", "bg_color")],
+    ]
+    if has_ai():
+        rows.insert(1, [btn("🤖 ИИ-генерация фона", "bg_ai")])
+    return kb(*rows)
+
 async def show_bg_menu_from_query(q) -> int:
     await q.edit_message_text(
         "🎨 *Выбери тип фона для всех слайдов:*",
         parse_mode="Markdown",
-        reply_markup=kb(
-            [btn("🖼 Готовые шаблоны (8 стилей)", "bg_template")],
-            [btn("🤖 ИИ-генерация (DALL-E)", "bg_ai")],
-            [btn("📸 Загрузить своё фото", "bg_photo")],
-            [btn("🎨 Цвет / градиент", "bg_color")],
-        ),
+        reply_markup=bg_keyboard(),
     )
     return CHOOSE_BG
 
@@ -414,12 +469,7 @@ async def show_bg_menu_from_msg(msg) -> int:
     await msg.reply_text(
         "🎨 *Выбери тип фона для всех слайдов:*",
         parse_mode="Markdown",
-        reply_markup=kb(
-            [btn("🖼 Готовые шаблоны (8 стилей)", "bg_template")],
-            [btn("🤖 ИИ-генерация (DALL-E)", "bg_ai")],
-            [btn("📸 Загрузить своё фото", "bg_photo")],
-            [btn("🎨 Цвет / градиент", "bg_color")],
-        ),
+        reply_markup=bg_keyboard(),
     )
     return CHOOSE_BG
 
@@ -430,7 +480,7 @@ async def cmd_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         f"👋 Привет, *{u.effective_user.first_name}*!\n\n"
         "Я создаю *карусели для Instagram* 🎠\n\n"
         "✅ Текст вручную *или* через ИИ\n"
-        "✅ Фоны: шаблоны, DALL-E, своё фото, цвет\n"
+        "✅ Фоны: шаблоны, ИИ, своё фото, цвет\n"
         "✅ Выгрузка: *ZIP (PNG) + PDF*\n"
         "✅ Размер слайдов: *1080 × 1080 px*\n\n"
         "Нажми ↓ чтобы начать!",
@@ -451,7 +501,7 @@ async def cb_how(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         "2️⃣ Введи текст сам *или* дай тему — ИИ напишет\n"
         "3️⃣ Выбери фон:\n"
         "   • 8 готовых шаблонов\n"
-        "   • DALL-E генерация по описанию\n"
+        "   • ИИ-генерация по описанию\n"
         "   • Загрузи своё фото\n"
         "   • Любой цвет или градиент\n"
         "4️⃣ Получи *ZIP* с PNG слайдами + *PDF*\n\n"
@@ -486,8 +536,7 @@ async def cb_slides(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         f"✅ Слайдов: *{n}*\n\n📝 *Как заполнить контент?*",
         parse_mode="Markdown",
         reply_markup=kb(
-            [btn("✍️ Введу текст вручную", "ct_manual")],
-            [btn("🤖 Сгенерировать через ИИ (GPT)", "ct_ai")],
+            *content_keyboard().inline_keyboard,
         ),
     )
     return CHOOSE_CONTENT
@@ -498,6 +547,13 @@ async def cb_content_type(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     s = sess(q.from_user.id)
     s.content_type = q.data.split("_")[1]
     if s.content_type == "ai":
+        if not has_ai():
+            await q.edit_message_text(
+                "ИИ-режим сейчас недоступен: не задан OPENROUTER_API_KEY.\n\n"
+                "Можно продолжить вручную.",
+                reply_markup=kb([btn("✍️ Ввести текст вручную", "ct_manual")]),
+            )
+            return CHOOSE_CONTENT
         await q.edit_message_text(
             "🤖 Введи *тему* карусели:\n\n"
             "_Примеры:_\n"
@@ -532,10 +588,9 @@ async def msg_topic(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             + [f"Пункт {i}" for i in range(1, s.slides_count - 1)]
             + ["Подпишись и сохрани! 🔔"]
         )
-    preview = "\n\n".join(f"*{i+1}.* {t}" for i, t in enumerate(s.slide_texts))
+    preview = "\n\n".join(f"{i+1}. {t}" for i, t in enumerate(s.slide_texts))
     await wait_msg.edit_text(
-        f"📝 *Сгенерированные тексты:*\n\n{preview}",
-        parse_mode="Markdown",
+        f"📝 Сгенерированные тексты:\n\n{preview}",
         reply_markup=kb(
             [btn("✅ Отлично, продолжить!", "texts_ok")],
             [btn("🔄 Перегенерировать", "regen")],
@@ -559,10 +614,9 @@ async def cb_regen(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             s.slide_texts = texts[: s.slides_count]
     except Exception as e:
         logger.error(f"Ошибка регенерации: {e}")
-    preview = "\n\n".join(f"*{i+1}.* {t}" for i, t in enumerate(s.slide_texts))
+    preview = "\n\n".join(f"{i+1}. {t}" for i, t in enumerate(s.slide_texts))
     await q.edit_message_text(
-        f"📝 *Новые тексты:*\n\n{preview}",
-        parse_mode="Markdown",
+        f"📝 Новые тексты:\n\n{preview}",
         reply_markup=kb(
             [btn("✅ Отлично!", "texts_ok")],
             [btn("🔄 Ещё раз", "regen")],
@@ -621,6 +675,13 @@ async def cb_bg_type(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         return CHOOSE_TEMPLATE
 
     elif t == "ai":
+        if not has_ai():
+            await q.edit_message_text(
+                "ИИ-фоны сейчас недоступны: не задан OPENROUTER_API_KEY.\n\n"
+                "Выбери шаблон, свой фон или цвет.",
+                reply_markup=bg_keyboard(),
+            )
+            return CHOOSE_BG
         await q.edit_message_text(
             "🤖 Опиши желаемый фон:\n\n"
             "_Примеры:_\n"
@@ -669,7 +730,7 @@ async def msg_bg_prompt(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     s.bg_prompt = u.message.text
     await u.message.reply_text(
         f"✅ Фон: *{s.bg_prompt}*\n\n"
-        "⚠️ _DALL-E генерирует фон ~15-20 сек во время создания_",
+        "⚠️ _ИИ генерирует фон во время создания, обычно это занимает 15–30 секунд_",
         parse_mode="Markdown",
         reply_markup=kb([btn("🚀 Генерировать карусель!", "gen")]),
     )
@@ -760,11 +821,19 @@ async def cb_gen(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         parse_mode="Markdown",
     )
     try:
-        zip_bytes, pdf_bytes = await build_carousel(s)
+        zip_bytes, pdf_bytes, preview_bytes = await build_carousel(s)
         ctx.user_data["zip"] = zip_bytes
         ctx.user_data["pdf"] = pdf_bytes
-        await q.edit_message_text(
-            f"✅ *Карусель готова!* ({len(s.slide_texts)} слайдов)\n\nВ каком формате отправить?",
+        ctx.user_data["preview"] = preview_bytes
+        await q.edit_message_text("✅ Карусель готова! Отправляю предпросмотр обложки...")
+        await ctx.bot.send_photo(
+            q.message.chat_id,
+            io.BytesIO(preview_bytes),
+            caption=f"Предпросмотр обложки. Всего слайдов: {len(s.slide_texts)}",
+        )
+        await ctx.bot.send_message(
+            q.message.chat_id,
+            "В каком формате отправить готовую карусель?",
             parse_mode="Markdown",
             reply_markup=kb(
                 [btn("📦 ZIP (PNG слайды)", "fmt_zip"), btn("📄 PDF", "fmt_pdf")],
@@ -837,9 +906,9 @@ def main():
     if not TELEGRAM_TOKEN:
         raise SystemExit("❌ Не задан TELEGRAM_TOKEN")
     if not OPENROUTER_API_KEY:
-        raise SystemExit("❌ Не задан OPENROUTER_API_KEY")
+        logger.warning("OPENROUTER_API_KEY не задан: AI-текст и AI-фоны будут скрыты, ручной режим работает.")
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).concurrent_updates(False).build()
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", cmd_start)],

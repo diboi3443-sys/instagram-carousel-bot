@@ -2,7 +2,11 @@
 nixPkgs = ["python312", "python312Packages.pip", "dejavu_fonts"]
 
 [phases.install]
-cmds = ["pip install -r requirements.txt"]
+cmds = [
+  "python -m venv /app/.venv",
+  "/app/.venv/bin/pip install --upgrade pip",
+  "/app/.venv/bin/pip install -r requirements.txt"
+]
 
 [start]
-cmd = "python carousel_bot.py"
+cmd = "/app/.venv/bin/python carousel_bot.py"

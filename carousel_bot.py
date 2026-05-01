@@ -317,9 +317,33 @@ def panel_fill(panel_type: str, first: bool) -> tuple:
     return (0, 0, 0, 96) if first else (255, 255, 255, 166)
 
 def text_palette(panel_type: str, first: bool):
-    if panel_type in ("light", "frosted") or (panel_type == "minimal" and not first):
+    if not first and panel_type != "solid_dark":
+        return (16, 18, 24, 238), (40, 44, 54, 210)
+    if panel_type in ("light", "frosted"):
         return (16, 18, 24, 238), (40, 44, 54, 210)
     return (255, 255, 255, 255), (255, 255, 255, 178)
+
+def luminance(rgb: tuple[int, int, int]) -> float:
+    r, g, b = rgb
+    return (r * 299 + g * 587 + b * 114) / 1000
+
+def readable_accent(accent: tuple[int, int, int], on_light: bool) -> tuple[int, int, int]:
+    if on_light and luminance(accent) > 150:
+        return tuple(max(24, int(v * 0.48)) for v in accent)
+    return accent
+
+def add_template_texture(img: Image.Image, c1: tuple, c2: Optional[tuple]) -> Image.Image:
+    base = img.convert("RGBA")
+    layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    accent = c2 or c1
+    d.polygon([(0, 220), (SLIDE_W, 0), (SLIDE_W, 230), (0, 520)], fill=(*accent, 42))
+    d.polygon([(0, SLIDE_H - 280), (SLIDE_W, SLIDE_H - 520), (SLIDE_W, SLIDE_H), (0, SLIDE_H)], fill=(*c1, 52))
+    for x in range(-200, SLIDE_W + 260, 180):
+        d.line([(x, 0), (x + 520, SLIDE_H)], fill=(255, 255, 255, 16), width=2)
+    for y in range(150, SLIDE_H, 190):
+        d.line([(74, y), (SLIDE_W - 74, y - 36)], fill=(255, 255, 255, 12), width=1)
+    return Image.alpha_composite(base, layer).convert("RGB")
 
 def trim_uniform_border(img: Image.Image) -> Image.Image:
     src = img.convert("RGB")
@@ -390,6 +414,8 @@ def create_slide(
         base = make_gradient(SLIDE_W, SLIDE_H, c1, c2)
     else:
         base = Image.new("RGB", (SLIDE_W, SLIDE_H), c1)
+    if not bg_img:
+        base = add_template_texture(base, c1, c2)
 
     canvas = base.convert("RGBA")
     draw = ImageDraw.Draw(canvas)
@@ -404,8 +430,8 @@ def create_slide(
     # Тонкая система навигации вместо декоративных полос.
     progress_w = SLIDE_W - pad * 2
     progress_y = 62
-    draw.rounded_rectangle((pad, progress_y, pad + progress_w, progress_y + 8), radius=4, fill=(255, 255, 255, 58))
-    draw.rounded_rectangle((pad, progress_y, pad + int(progress_w * num / total), progress_y + 8), radius=4, fill=(*accent, 235))
+    draw.rounded_rectangle((pad, progress_y, pad + progress_w, progress_y + 6), radius=3, fill=(255, 255, 255, 36))
+    draw.rounded_rectangle((pad, progress_y, pad + int(progress_w * num / total), progress_y + 6), radius=3, fill=(*accent, 185))
 
     count_font = get_font(28, bold=True)
     count = f"{num:02d}/{total:02d}"
@@ -417,9 +443,10 @@ def create_slide(
         panel = (pad, 450, SLIDE_W - pad, 930)
         fill = panel_fill(panel_type, True)
         text_fill, muted = text_palette(panel_type, True)
+        label_color = readable_accent(accent, text_fill[0] < 80)
         if fill[3] > 0:
             draw.rounded_rectangle(panel, radius=radius, fill=fill, outline=(255, 255, 255, 46), width=2)
-        draw.rounded_rectangle((pad + 36, panel[1] + 40, pad + 126, panel[1] + 48), radius=4, fill=(*accent, 255))
+        draw.rounded_rectangle((pad + 36, panel[1] + 40, pad + 126, panel[1] + 48), radius=4, fill=(*label_color, 255))
         fnt, lines, lh = fit_text(text, draw, panel[2] - panel[0] - 80, 285, st["title"], 40, True)
         draw_multiline(draw, lines, (panel[0] + 40, panel[1] + 84), fnt, lh, text_fill, align=align, width=panel[2] - panel[0] - 80)
         hint_font = get_font(30, bold=True)
@@ -428,20 +455,22 @@ def create_slide(
         panel = (pad, 410, SLIDE_W - pad, 955)
         fill = panel_fill(panel_type, False)
         text_fill, _ = text_palette(panel_type, False)
+        label_color = readable_accent(accent, text_fill[0] < 80)
         if fill[3] > 0:
             draw.rounded_rectangle(panel, radius=radius, fill=fill)
         label_font = get_font(28, bold=True)
-        draw.text((panel[0] + 46, panel[1] + 42), "CTA", font=label_font, fill=(*accent, 255))
+        draw.text((panel[0] + 46, panel[1] + 42), "CTA", font=label_font, fill=(*label_color, 255))
         fnt, lines, lh = fit_text(text, draw, panel[2] - panel[0] - 92, 325, st["cta"], 36, True)
         draw_multiline(draw, lines, (panel[0] + 46, panel[1] + 102), fnt, lh, text_fill, align=align, width=panel[2] - panel[0] - 92)
     else:
         panel = (pad, 445, SLIDE_W - pad, 900)
         fill = panel_fill(panel_type, False)
         text_fill, _ = text_palette(panel_type, False)
+        label_color = readable_accent(accent, text_fill[0] < 80)
         if fill[3] > 0:
             draw.rounded_rectangle(panel, radius=radius, fill=fill)
         label_font = get_font(28, bold=True)
-        draw.text((panel[0] + 42, panel[1] + 38), f"Слайд {num}", font=label_font, fill=(*accent, 255))
+        draw.text((panel[0] + 42, panel[1] + 38), f"Слайд {num}", font=label_font, fill=(*label_color, 255))
         fnt, lines, lh = fit_text(text, draw, panel[2] - panel[0] - 84, 280, st["body"], 30, panel_type == "solid_dark")
         draw_multiline(draw, lines, (panel[0] + 42, panel[1] + 104), fnt, lh, text_fill, align=align, width=panel[2] - panel[0] - 84)
 

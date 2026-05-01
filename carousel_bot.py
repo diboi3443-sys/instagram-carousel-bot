@@ -8,7 +8,7 @@ Telegram бот для создания каруселей для Instagram
 import os, io, re, json, zipfile, asyncio, logging, tempfile, base64, hashlib
 from typing import Optional
 from dataclasses import dataclass, field
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageChops
 import openai
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -39,11 +39,11 @@ def env_present(name: str) -> str:
 TELEGRAM_TOKEN      = env_value("TELEGRAM_TOKEN", "BOT_TOKEN", "TELEGRAM_BOT_TOKEN")
 OPENROUTER_API_KEY  = env_value("OPENROUTER_API_KEY", "OPENAI_API_KEY")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-TEXT_MODEL          = env_value("TEXT_MODEL") or "openai/gpt-4o-mini"
+TEXT_MODEL          = env_value("TEXT_MODEL") or "anthropic/claude-sonnet-4.5"
 IMAGE_MODEL         = env_value("IMAGE_MODEL") or "google/gemini-2.5-flash-image"
 BOT_TITLE           = env_value("BOT_TITLE") or "Carousel Bot"
 
-SLIDE_W, SLIDE_H = 1080, 1080
+SLIDE_W, SLIDE_H = 1080, 1350
 
 # ─── Состояния диалога ────────────────────────────────────────────────────────
 (
@@ -219,6 +219,69 @@ def wrap_text(text: str, fnt, max_w: int, draw: ImageDraw.ImageDraw) -> list[str
         lines.append(" ".join(cur))
     return lines or [""]
 
+def text_size(draw: ImageDraw.ImageDraw, text: str, fnt) -> tuple[int, int]:
+    bbox = draw.textbbox((0, 0), text, font=fnt)
+    return bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+def fit_text(text: str, draw: ImageDraw.ImageDraw, max_w: int, max_h: int, start: int, minimum: int, bold: bool) -> tuple:
+    for size in range(start, minimum - 1, -2):
+        fnt = get_font(size, bold=bold)
+        lines = wrap_text(text, fnt, max_w, draw)
+        line_h = int(size * 1.18)
+        block_h = line_h * len(lines)
+        widest = max((text_size(draw, line, fnt)[0] for line in lines), default=0)
+        if widest <= max_w and block_h <= max_h:
+            return fnt, lines, line_h
+    fnt = get_font(minimum, bold=bold)
+    return fnt, wrap_text(text, fnt, max_w, draw), int(minimum * 1.18)
+
+def draw_multiline(draw: ImageDraw.ImageDraw, lines: list[str], xy: tuple[int, int], fnt, line_h: int, fill, align: str = "left", width: int = 0):
+    x, y = xy
+    for line in lines:
+        tw, _ = text_size(draw, line, fnt)
+        tx = x
+        if align == "center":
+            tx = x + max((width - tw) // 2, 0)
+        draw.text((tx, y), line, font=fnt, fill=fill)
+        y += line_h
+
+def trim_uniform_border(img: Image.Image) -> Image.Image:
+    src = img.convert("RGB")
+    corner = src.getpixel((0, 0))
+    bg = Image.new("RGB", src.size, corner)
+    diff = ImageChops.difference(src, bg).convert("L")
+    mask = diff.point(lambda p: 255 if p > 22 else 0)
+    bbox = mask.getbbox()
+    if not bbox:
+        return src
+    x1, y1, x2, y2 = bbox
+    w, h = src.size
+    border_x = min(x1, w - x2)
+    border_y = min(y1, h - y2)
+    if border_x > w * 0.04 or border_y > h * 0.04:
+        pad = 8
+        return src.crop((max(0, x1 - pad), max(0, y1 - pad), min(w, x2 + pad), min(h, y2 + pad)))
+    return src
+
+def cover_resize(img: Image.Image, w: int, h: int) -> Image.Image:
+    src = trim_uniform_border(img).convert("RGB")
+    scale = max(w / src.width, h / src.height)
+    nw, nh = int(src.width * scale), int(src.height * scale)
+    resized = src.resize((nw, nh), Image.LANCZOS)
+    left = max((nw - w) // 2, 0)
+    top = max((nh - h) // 2, 0)
+    return resized.crop((left, top, left + w, top + h))
+
+def add_vignette(img: Image.Image) -> Image.Image:
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 86))
+    base = img.convert("RGBA")
+    base = Image.alpha_composite(base, overlay)
+    glow = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    gd.rectangle((0, 0, SLIDE_W, int(SLIDE_H * 0.28)), fill=(0, 0, 0, 56))
+    gd.rectangle((0, int(SLIDE_H * 0.68), SLIDE_W, SLIDE_H), fill=(0, 0, 0, 72))
+    return Image.alpha_composite(base, glow).convert("RGB")
+
 def hex_to_rgb(hex_color: str) -> tuple:
     h = hex_color.lstrip("#")
     return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
@@ -244,66 +307,58 @@ def create_slide(
     is_first: bool,
     is_last: bool,
 ) -> Image.Image:
-    # Фон
     if bg_img:
-        base = bg_img.copy().convert("RGBA").resize((SLIDE_W, SLIDE_H), Image.LANCZOS)
-        overlay = Image.new("RGBA", (SLIDE_W, SLIDE_H), (0, 0, 0, 110))
-        base = Image.alpha_composite(base, overlay).convert("RGB")
+        base = add_vignette(cover_resize(bg_img, SLIDE_W, SLIDE_H))
     elif c2:
         base = make_gradient(SLIDE_W, SLIDE_H, c1, c2)
     else:
         base = Image.new("RGB", (SLIDE_W, SLIDE_H), c1)
 
-    draw = ImageDraw.Draw(base)
-    rgb = hex_to_rgb(tc)
-    pad = 90
-    cw = SLIDE_W - pad * 2
+    canvas = base.convert("RGBA")
+    draw = ImageDraw.Draw(canvas)
+    white = (255, 255, 255, 255)
+    soft = (255, 255, 255, 210)
+    muted = (255, 255, 255, 170)
+    ink = (16, 18, 24, 238)
+    accent = hex_to_rgb(tc)
+    pad = 84
 
-    # Декоративные линии
-    draw.rectangle([(pad, 58), (SLIDE_W - pad, 64)], fill=(*rgb, 160))
-    draw.rectangle([(pad, SLIDE_H - 64), (SLIDE_W - pad, SLIDE_H - 58)], fill=(*rgb, 160))
+    # Тонкая система навигации вместо декоративных полос.
+    progress_w = SLIDE_W - pad * 2
+    progress_y = 62
+    draw.rounded_rectangle((pad, progress_y, pad + progress_w, progress_y + 8), radius=4, fill=(255, 255, 255, 58))
+    draw.rounded_rectangle((pad, progress_y, pad + int(progress_w * num / total), progress_y + 8), radius=4, fill=(*accent, 235))
 
-    # Номер слайда
-    cf = get_font(28)
-    ct = f"{num}/{total}"
-    cb = draw.textbbox((0, 0), ct, font=cf)
-    draw.text((SLIDE_W - pad - (cb[2] - cb[0]), SLIDE_H - 52), ct, font=cf, fill=(*rgb, 180))
-
-    def draw_centered_text(fnt, lines, lh, y_start):
-        y = y_start
-        for line in lines:
-            lb = draw.textbbox((0, 0), line, font=fnt)
-            x = (SLIDE_W - (lb[2] - lb[0])) // 2
-            # Тень
-            draw.text((x + 3, y + 3), line, font=fnt, fill=(0, 0, 0, 100))
-            draw.text((x, y), line, font=fnt, fill=rgb)
-            y += lh
+    count_font = get_font(28, bold=True)
+    count = f"{num:02d}/{total:02d}"
+    cw, ch = text_size(draw, count, count_font)
+    draw.rounded_rectangle((SLIDE_W - pad - cw - 34, SLIDE_H - 78, SLIDE_W - pad, SLIDE_H - 30), radius=24, fill=(0, 0, 0, 112))
+    draw.text((SLIDE_W - pad - cw - 17, SLIDE_H - 70), count, font=count_font, fill=soft)
 
     if is_first:
-        fnt = get_font(66, bold=True)
-        lh = 82
-        lines = wrap_text(text, fnt, cw, draw)
-        th = len(lines) * lh
-        draw_centered_text(fnt, lines, lh, (SLIDE_H - th) // 2 - 30)
-        # Подсказка "листай"
-        hf = get_font(30)
-        ht = "Листай →"
-        hb = draw.textbbox((0, 0), ht, font=hf)
-        draw.text(((SLIDE_W - (hb[2] - hb[0])) // 2, SLIDE_H - 115), ht, font=hf, fill=(*rgb, 160))
+        panel = (pad, 450, SLIDE_W - pad, 930)
+        draw.rounded_rectangle(panel, radius=34, fill=(0, 0, 0, 122), outline=(255, 255, 255, 48), width=2)
+        draw.rounded_rectangle((pad + 36, panel[1] + 40, pad + 126, panel[1] + 48), radius=4, fill=(*accent, 255))
+        fnt, lines, lh = fit_text(text, draw, panel[2] - panel[0] - 80, 285, 76, 42, True)
+        draw_multiline(draw, lines, (panel[0] + 40, panel[1] + 84), fnt, lh, white)
+        hint_font = get_font(30, bold=True)
+        draw.text((panel[0] + 40, panel[3] - 78), "Листай дальше", font=hint_font, fill=muted)
     elif is_last:
-        fnt = get_font(58, bold=True)
-        lh = 74
-        lines = wrap_text(text, fnt, cw, draw)
-        th = len(lines) * lh
-        draw_centered_text(fnt, lines, lh, (SLIDE_H - th) // 2)
+        panel = (pad, 410, SLIDE_W - pad, 955)
+        draw.rounded_rectangle(panel, radius=38, fill=(255, 255, 255, 226))
+        label_font = get_font(28, bold=True)
+        draw.text((panel[0] + 46, panel[1] + 42), "CTA", font=label_font, fill=(*accent, 255))
+        fnt, lines, lh = fit_text(text, draw, panel[2] - panel[0] - 92, 325, 68, 38, True)
+        draw_multiline(draw, lines, (panel[0] + 46, panel[1] + 102), fnt, lh, ink)
     else:
-        fnt = get_font(44)
-        lh = 62
-        lines = wrap_text(text, fnt, cw, draw)
-        th = len(lines) * lh
-        draw_centered_text(fnt, lines, lh, (SLIDE_H - th) // 2)
+        panel = (pad, 445, SLIDE_W - pad, 900)
+        draw.rounded_rectangle(panel, radius=32, fill=(255, 255, 255, 218))
+        label_font = get_font(28, bold=True)
+        draw.text((panel[0] + 42, panel[1] + 38), f"Слайд {num}", font=label_font, fill=(*accent, 255))
+        fnt, lines, lh = fit_text(text, draw, panel[2] - panel[0] - 84, 280, 54, 32, False)
+        draw_multiline(draw, lines, (panel[0] + 42, panel[1] + 104), fnt, lh, ink)
 
-    return base
+    return canvas.convert("RGB")
 
 # ─── AI функции (OpenRouter) ──────────────────────────────────────────────────
 def _or_client():
@@ -317,20 +372,25 @@ async def ai_generate_texts(topic: str, n: int) -> list[str]:
         raise RuntimeError("OPENROUTER_API_KEY не задан")
 
     prompt = (
-        f'Создай контент для Instagram карусели на тему: "{topic}"\n'
+        "Ты senior-копирайтер для Instagram-каруселей. Нужна не вода, а готовые короткие слайды.\n"
+        f'Тема: "{topic}"\n'
         f"Количество слайдов: {n}\n\n"
-        f"- Слайд 1: цепляющий заголовок (≤60 символов)\n"
-        f"- Слайды 2–{n-1}: одна мысль/факт на слайд (≤120 символов каждый)\n"
-        f"- Слайд {n}: призыв к действию (CTA)\n\n"
+        "Правила:\n"
+        "- Слайд 1: сильный hook, 5-9 слов, без канцелярита.\n"
+        f"- Слайды 2-{n-1}: конкретная мысль или микро-инсайт, 65-115 символов.\n"
+        f"- Слайд {n}: естественный CTA, 55-100 символов.\n"
+        "- Не начинай каждый слайд одинаково.\n"
+        "- Не используй общие фразы вроде 'позволяет обрабатывать огромные объемы данных'.\n"
+        "- Пиши так, чтобы текст можно было сразу поставить на дизайн.\n\n"
         f'Ответь ТОЛЬКО JSON: {{"slides": ["...", "..."]}}\n'
-        f"Пиши по-русски, живо и вовлекающе."
+        "Язык: русский."
     )
     r = await _or_client().chat.completions.create(
         model=TEXT_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.8,
         max_tokens=700,
-        extra_headers={"HTTP-Referer": "https://t.me/carousel_bot", "X-Title": "Carousel Bot"},
+        extra_headers={"HTTP-Referer": "https://t.me/carousel_bot", "X-Title": BOT_TITLE},
     )
     raw = r.choices[0].message.content or ""
     m = re.search(r"\{.*\}", raw, re.DOTALL)
@@ -348,8 +408,9 @@ async def ai_generate_bg(prompt: str) -> Optional[bytes]:
         return None
 
     full = (
-        f"Abstract artistic background for Instagram post, {prompt}, "
-        "no text, no letters, square format, high quality, aesthetic, vibrant colors"
+        f"Full-bleed abstract editorial background for an Instagram carousel, {prompt}, "
+        "no text, no typography, no frames, no borders, no mockup, no poster inside poster, "
+        "clean edges, rich depth, enough negative space for text, high-end social media design"
     )
     try:
         r = await _or_client().chat.completions.create(
@@ -493,7 +554,7 @@ async def cmd_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         "✅ Текст вручную *или* через ИИ\n"
         "✅ Фоны: шаблоны, ИИ, своё фото, цвет\n"
         "✅ Выгрузка: *ZIP (PNG) + PDF*\n"
-        "✅ Размер слайдов: *1080 × 1080 px*\n\n"
+        "✅ Размер слайдов: *1080 × 1350 px* (4:5)\n\n"
         "Нажми ↓ чтобы начать!",
         parse_mode="Markdown",
         reply_markup=kb(
@@ -516,7 +577,7 @@ async def cb_how(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         "   • Загрузи своё фото\n"
         "   • Любой цвет или градиент\n"
         "4️⃣ Получи *ZIP* с PNG слайдами + *PDF*\n\n"
-        "_Слайды: 1080×1080 px — идеальный формат для Instagram_",
+        "_Слайды: 1080×1350 px — вертикальный 4:5 формат для Instagram_",
         parse_mode="Markdown",
         reply_markup=kb([btn("🎨 Начать создание", "start_create")]),
     )

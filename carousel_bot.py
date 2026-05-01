@@ -57,9 +57,10 @@ SLIDE_W, SLIDE_H = 1080, 1350
     ENTER_BG_PROMPT,
     WAIT_BG_PHOTO,
     CHOOSE_COLOR,
+    CHOOSE_STYLE,
     CONFIRM,
     CHOOSE_FORMAT,
-) = range(12)
+) = range(13)
 
 # ─── Дизайн-шаблоны ───────────────────────────────────────────────────────────
 TEMPLATES = {
@@ -81,6 +82,59 @@ COLOR_PRESETS = {
     "custom": {"name": "🎨 Свой HEX",    "bg": None,            "tc": "#FFFFFF"},
 }
 
+STYLE_PRESETS = {
+    "modern": {
+        "name": "⚡ Modern",
+        "desc": "контрастные карточки, крупный гротеск",
+        "title": 76,
+        "body": 54,
+        "cta": 68,
+        "panel": "dark_cover",
+        "radius": 34,
+        "align": "left",
+    },
+    "editorial": {
+        "name": "📰 Editorial",
+        "desc": "журнальный стиль, светлые панели",
+        "title": 70,
+        "body": 48,
+        "cta": 62,
+        "panel": "light",
+        "radius": 12,
+        "align": "left",
+    },
+    "bold": {
+        "name": "🔥 Bold",
+        "desc": "максимально крупный жирный текст",
+        "title": 86,
+        "body": 60,
+        "cta": 76,
+        "panel": "solid_dark",
+        "radius": 0,
+        "align": "center",
+    },
+    "soft": {
+        "name": "🌿 Soft",
+        "desc": "мягкие карточки и спокойная типографика",
+        "title": 68,
+        "body": 48,
+        "cta": 60,
+        "panel": "frosted",
+        "radius": 42,
+        "align": "left",
+    },
+    "minimal": {
+        "name": "◻️ Minimal",
+        "desc": "чистая верстка, меньше декора",
+        "title": 72,
+        "body": 50,
+        "cta": 64,
+        "panel": "minimal",
+        "radius": 6,
+        "align": "left",
+    },
+}
+
 # ─── Сессия пользователя ──────────────────────────────────────────────────────
 @dataclass
 class Session:
@@ -98,6 +152,7 @@ class Session:
     bg_c1:          tuple          = (75, 0, 130)
     bg_c2:          Optional[tuple] = (138, 43, 226)
     text_color:     str            = "#FFFFFF"
+    style:          str            = "modern"
     export_format:  str            = "both"
 
 _sessions: dict[int, Session] = {}
@@ -247,6 +302,25 @@ def draw_multiline(draw: ImageDraw.ImageDraw, lines: list[str], xy: tuple[int, i
         draw.text((tx, y), line, font=fnt, fill=fill)
         y += line_h
 
+def style_conf(key: str) -> dict:
+    return STYLE_PRESETS.get(key, STYLE_PRESETS["modern"])
+
+def panel_fill(panel_type: str, first: bool) -> tuple:
+    if panel_type == "light":
+        return (255, 255, 255, 232)
+    if panel_type == "frosted":
+        return (255, 255, 255, 205)
+    if panel_type == "minimal":
+        return (255, 255, 255, 0) if first else (255, 255, 255, 226)
+    if panel_type == "solid_dark":
+        return (0, 0, 0, 210)
+    return (0, 0, 0, 132) if first else (255, 255, 255, 218)
+
+def text_palette(panel_type: str, first: bool):
+    if panel_type in ("light", "frosted") or (panel_type == "minimal" and not first):
+        return (16, 18, 24, 238), (40, 44, 54, 210)
+    return (255, 255, 255, 255), (255, 255, 255, 178)
+
 def trim_uniform_border(img: Image.Image) -> Image.Image:
     src = img.convert("RGB")
     corner = src.getpixel((0, 0))
@@ -306,6 +380,7 @@ def create_slide(
     c1: tuple,
     c2: Optional[tuple],
     tc: str,
+    style_key: str,
     is_first: bool,
     is_last: bool,
 ) -> Image.Image:
@@ -318,11 +393,12 @@ def create_slide(
 
     canvas = base.convert("RGBA")
     draw = ImageDraw.Draw(canvas)
-    white = (255, 255, 255, 255)
     soft = (255, 255, 255, 210)
-    muted = (255, 255, 255, 170)
-    ink = (16, 18, 24, 238)
     accent = hex_to_rgb(tc)
+    st = style_conf(style_key)
+    panel_type = st["panel"]
+    align = st["align"]
+    radius = st["radius"]
     pad = 84
 
     # Тонкая система навигации вместо декоративных полос.
@@ -339,26 +415,35 @@ def create_slide(
 
     if is_first:
         panel = (pad, 450, SLIDE_W - pad, 930)
-        draw.rounded_rectangle(panel, radius=34, fill=(0, 0, 0, 122), outline=(255, 255, 255, 48), width=2)
+        fill = panel_fill(panel_type, True)
+        text_fill, muted = text_palette(panel_type, True)
+        if fill[3] > 0:
+            draw.rounded_rectangle(panel, radius=radius, fill=fill, outline=(255, 255, 255, 46), width=2)
         draw.rounded_rectangle((pad + 36, panel[1] + 40, pad + 126, panel[1] + 48), radius=4, fill=(*accent, 255))
-        fnt, lines, lh = fit_text(text, draw, panel[2] - panel[0] - 80, 285, 76, 42, True)
-        draw_multiline(draw, lines, (panel[0] + 40, panel[1] + 84), fnt, lh, white)
+        fnt, lines, lh = fit_text(text, draw, panel[2] - panel[0] - 80, 285, st["title"], 40, True)
+        draw_multiline(draw, lines, (panel[0] + 40, panel[1] + 84), fnt, lh, text_fill, align=align, width=panel[2] - panel[0] - 80)
         hint_font = get_font(30, bold=True)
         draw.text((panel[0] + 40, panel[3] - 78), "Листай дальше", font=hint_font, fill=muted)
     elif is_last:
         panel = (pad, 410, SLIDE_W - pad, 955)
-        draw.rounded_rectangle(panel, radius=38, fill=(255, 255, 255, 226))
+        fill = panel_fill(panel_type, False)
+        text_fill, _ = text_palette(panel_type, False)
+        if fill[3] > 0:
+            draw.rounded_rectangle(panel, radius=radius, fill=fill)
         label_font = get_font(28, bold=True)
         draw.text((panel[0] + 46, panel[1] + 42), "CTA", font=label_font, fill=(*accent, 255))
-        fnt, lines, lh = fit_text(text, draw, panel[2] - panel[0] - 92, 325, 68, 38, True)
-        draw_multiline(draw, lines, (panel[0] + 46, panel[1] + 102), fnt, lh, ink)
+        fnt, lines, lh = fit_text(text, draw, panel[2] - panel[0] - 92, 325, st["cta"], 36, True)
+        draw_multiline(draw, lines, (panel[0] + 46, panel[1] + 102), fnt, lh, text_fill, align=align, width=panel[2] - panel[0] - 92)
     else:
         panel = (pad, 445, SLIDE_W - pad, 900)
-        draw.rounded_rectangle(panel, radius=32, fill=(255, 255, 255, 218))
+        fill = panel_fill(panel_type, False)
+        text_fill, _ = text_palette(panel_type, False)
+        if fill[3] > 0:
+            draw.rounded_rectangle(panel, radius=radius, fill=fill)
         label_font = get_font(28, bold=True)
         draw.text((panel[0] + 42, panel[1] + 38), f"Слайд {num}", font=label_font, fill=(*accent, 255))
-        fnt, lines, lh = fit_text(text, draw, panel[2] - panel[0] - 84, 280, 54, 32, False)
-        draw_multiline(draw, lines, (panel[0] + 42, panel[1] + 104), fnt, lh, ink)
+        fnt, lines, lh = fit_text(text, draw, panel[2] - panel[0] - 84, 280, st["body"], 30, panel_type == "solid_dark")
+        draw_multiline(draw, lines, (panel[0] + 42, panel[1] + 104), fnt, lh, text_fill, align=align, width=panel[2] - panel[0] - 84)
 
     return canvas.convert("RGB")
 
@@ -490,6 +575,7 @@ async def build_carousel(s: Session) -> tuple[bytes, bytes, bytes]:
             c1=c1,
             c2=c2,
             tc=s.text_color,
+            style_key=s.style,
             is_first=(i == 0),
             is_last=(i == len(s.slide_texts) - 1),
         )
@@ -550,6 +636,24 @@ def bg_keyboard() -> InlineKeyboardMarkup:
     if has_ai():
         rows.insert(1, [btn("🤖 ИИ-генерация фона", "bg_ai")])
     return kb(*rows)
+
+def style_keyboard() -> InlineKeyboardMarkup:
+    rows = [[btn(v["name"], f"style_{k}")] for k, v in STYLE_PRESETS.items()]
+    return InlineKeyboardMarkup(rows)
+
+async def show_style_menu_from_query(q) -> int:
+    text = "✨ *Выбери стиль оформления:*\n\n" + "\n".join(
+        f"{v['name']} — {v['desc']}" for v in STYLE_PRESETS.values()
+    )
+    await q.edit_message_text(text, parse_mode="Markdown", reply_markup=style_keyboard())
+    return CHOOSE_STYLE
+
+async def show_style_menu_from_msg(msg) -> int:
+    text = "✨ *Выбери стиль оформления:*\n\n" + "\n".join(
+        f"{v['name']} — {v['desc']}" for v in STYLE_PRESETS.values()
+    )
+    await msg.reply_text(text, parse_mode="Markdown", reply_markup=style_keyboard())
+    return CHOOSE_STYLE
 
 async def show_bg_menu_from_query(q) -> int:
     await q.edit_message_text(
@@ -824,22 +928,21 @@ async def cb_template(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     t = TEMPLATES[key]
     s.text_color = t["tc"]
     await q.edit_message_text(
-        f"✅ Шаблон: *{t['name']}*\n\nВсё готово! Нажми для генерации 🚀",
+        f"✅ Шаблон: *{t['name']}*\n\nТеперь выбери стиль оформления.",
         parse_mode="Markdown",
-        reply_markup=kb([btn("🚀 Генерировать карусель!", "gen")]),
     )
-    return CONFIRM
+    return await show_style_menu_from_query(q)
 
 async def msg_bg_prompt(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     s = sess(u.effective_user.id)
     s.bg_prompt = u.message.text
     await u.message.reply_text(
         f"✅ Фон: *{s.bg_prompt}*\n\n"
-        "⚠️ _ИИ генерирует фон во время создания, обычно это занимает 15–30 секунд_",
+        "⚠️ _ИИ генерирует фон во время создания, обычно это занимает 15–30 секунд_\n\n"
+        "Теперь выбери стиль оформления.",
         parse_mode="Markdown",
-        reply_markup=kb([btn("🚀 Генерировать карусель!", "gen")]),
     )
-    return CONFIRM
+    return await show_style_menu_from_msg(u.message)
 
 async def cb_ai_auto_bg(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = u.callback_query
@@ -850,11 +953,11 @@ async def cb_ai_auto_bg(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await q.edit_message_text(
         "✅ Режим выбран: *ИИ подберёт отдельный фон под каждый слайд*.\n\n"
         "Я сохраню общий стиль карусели, но картинки будут разными по смыслу каждого слайда.\n"
-        "Генерация может занять 1-3 минуты.",
+        "Генерация может занять 1-3 минуты.\n\n"
+        "Теперь выбери стиль оформления.",
         parse_mode="Markdown",
-        reply_markup=kb([btn("🚀 Генерировать карусель!", "gen")]),
     )
-    return CONFIRM
+    return await show_style_menu_from_query(q)
 
 async def msg_bg_photo(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     s = sess(u.effective_user.id)
@@ -873,17 +976,15 @@ async def msg_bg_photo(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             )
             return WAIT_BG_PHOTO
         await u.message.reply_text(
-            "✅ Все фото по слайдам получены! Готов к генерации.",
-            reply_markup=kb([btn("🚀 Генерировать карусель!", "gen")]),
+            "✅ Все фото по слайдам получены! Теперь выбери стиль оформления.",
         )
-        return CONFIRM
+        return await show_style_menu_from_msg(u.message)
 
     s.bg_photo = data
     await u.message.reply_text(
-        "✅ Фото получено! Готов к генерации.",
-        reply_markup=kb([btn("🚀 Генерировать карусель!", "gen")]),
+        "✅ Фото получено! Теперь выбери стиль оформления.",
     )
-    return CONFIRM
+    return await show_style_menu_from_msg(u.message)
 
 async def cb_color(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = u.callback_query
@@ -903,11 +1004,10 @@ async def cb_color(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     s.bg_c2 = None
     s.text_color = p["tc"]
     await q.edit_message_text(
-        f"✅ Цвет: *{p['name']}*",
+        f"✅ Цвет: *{p['name']}*\n\nТеперь выбери стиль оформления.",
         parse_mode="Markdown",
-        reply_markup=kb([btn("🚀 Генерировать карусель!", "gen")]),
     )
-    return CONFIRM
+    return await show_style_menu_from_query(q)
 
 async def msg_custom_color(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     s = sess(u.effective_user.id)
@@ -945,7 +1045,20 @@ async def msg_custom_color(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     r, g, b = s.bg_c1
     s.text_color = "#000000" if (r * 299 + g * 587 + b * 114) / 1000 > 128 else "#FFFFFF"
     await u.message.reply_text(
-        "✅ Цвет выбран!",
+        "✅ Цвет выбран! Теперь выбери стиль оформления.",
+    )
+    return await show_style_menu_from_msg(u.message)
+
+async def cb_style(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = u.callback_query
+    await q.answer()
+    s = sess(q.from_user.id)
+    key = q.data.split("_", 1)[1]
+    s.style = key if key in STYLE_PRESETS else "modern"
+    preset = style_conf(s.style)
+    await q.edit_message_text(
+        f"✅ Стиль: *{preset['name']}*\n\nВсё готово. Нажми для генерации 🚀",
+        parse_mode="Markdown",
         reply_markup=kb([btn("🚀 Генерировать карусель!", "gen")]),
     )
     return CONFIRM
@@ -1099,6 +1212,9 @@ def main():
             CHOOSE_COLOR: [
                 CallbackQueryHandler(cb_color, pattern="^clr_"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, msg_custom_color),
+            ],
+            CHOOSE_STYLE: [
+                CallbackQueryHandler(cb_style, pattern="^style_"),
             ],
             CONFIRM: [
                 CallbackQueryHandler(cb_gen, pattern="^gen$"),

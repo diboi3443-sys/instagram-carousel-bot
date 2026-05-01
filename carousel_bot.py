@@ -93,6 +93,8 @@ class Session:
     bg_template:    str            = "purple"
     bg_prompt:      str            = ""
     bg_photo:       Optional[bytes] = None
+    bg_photos:      list           = field(default_factory=list)
+    current_bg_slide: int          = 0
     bg_c1:          tuple          = (75, 0, 130)
     bg_c2:          Optional[tuple] = (138, 43, 226)
     text_color:     str            = "#FFFFFF"
@@ -408,7 +410,7 @@ async def ai_generate_bg(prompt: str) -> Optional[bytes]:
         return None
 
     full = (
-        f"Full-bleed abstract editorial background for an Instagram carousel, {prompt}, "
+        f"Full-bleed vertical 4:5 abstract editorial background for an Instagram carousel, {prompt}, "
         "no text, no typography, no frames, no borders, no mockup, no poster inside poster, "
         "clean edges, rich depth, enough negative space for text, high-end social media design"
     )
@@ -442,9 +444,18 @@ async def ai_generate_bg(prompt: str) -> Optional[bytes]:
         logger.warning(f"AI фон не получился: {e}")
     return None
 
+def slide_bg_prompt(s: Session, text: str, index: int, total: int) -> str:
+    topic = s.topic or (s.slide_texts[0] if s.slide_texts else "Instagram carousel")
+    return (
+        f"visual theme: {topic}; slide {index} of {total}; slide meaning: {text}; "
+        "keep a coherent premium editorial style across the carousel, use related colors, "
+        "different composition for this slide, abstract/metaphorical visual, no text"
+    )
+
 # ─── Сборка карусели ──────────────────────────────────────────────────────────
 async def build_carousel(s: Session) -> tuple[bytes, bytes, bytes]:
     bg_img, c1, c2 = None, s.bg_c1, s.bg_c2
+    slide_bg_imgs: list[Optional[Image.Image]] = []
 
     if s.bg_type == "template":
         t = TEMPLATES.get(s.bg_template, TEMPLATES["purple"])
@@ -456,8 +467,18 @@ async def build_carousel(s: Session) -> tuple[bytes, bytes, bytes]:
         else:
             c1, c2 = seeded_palette(s.bg_prompt)
             logger.warning("AI фон недоступен, использую уникальный градиент")
+    elif s.bg_type == "ai_auto":
+        c1, c2 = seeded_palette(" ".join(s.slide_texts) or s.topic)
+        for i, text in enumerate(s.slide_texts):
+            data = await ai_generate_bg(slide_bg_prompt(s, text, i + 1, len(s.slide_texts)))
+            slide_bg_imgs.append(Image.open(io.BytesIO(data)) if data else None)
+        if not any(slide_bg_imgs):
+            logger.warning("AI-фоны по слайдам недоступны, использую единый градиент")
     elif s.bg_type == "photo" and s.bg_photo:
         bg_img = Image.open(io.BytesIO(s.bg_photo))
+    elif s.bg_type == "photo_each" and s.bg_photos:
+        for data in s.bg_photos:
+            slide_bg_imgs.append(Image.open(io.BytesIO(data)) if data else None)
     # bg_type == "color" — c1/c2 уже установлены
 
     slides = [
@@ -465,7 +486,7 @@ async def build_carousel(s: Session) -> tuple[bytes, bytes, bytes]:
             text=text,
             num=i + 1,
             total=len(s.slide_texts),
-            bg_img=bg_img,
+            bg_img=slide_bg_imgs[i] if i < len(slide_bg_imgs) and slide_bg_imgs[i] else bg_img,
             c1=c1,
             c2=c2,
             tc=s.text_color,
@@ -522,7 +543,8 @@ def content_keyboard() -> InlineKeyboardMarkup:
 def bg_keyboard() -> InlineKeyboardMarkup:
     rows = [
         [btn("🖼 Готовые шаблоны (8 стилей)", "bg_template")],
-        [btn("📸 Загрузить своё фото", "bg_photo")],
+        [btn("📸 Одно своё фото на все слайды", "bg_photo")],
+        [btn("🧩 Свои фото по слайдам", "bg_photo_each")],
         [btn("🎨 Цвет / градиент", "bg_color")],
     ]
     if has_ai():
@@ -573,8 +595,8 @@ async def cb_how(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         "2️⃣ Введи текст сам *или* дай тему — ИИ напишет\n"
         "3️⃣ Выбери фон:\n"
         "   • 8 готовых шаблонов\n"
-        "   • ИИ-генерация по описанию\n"
-        "   • Загрузи своё фото\n"
+        "   • ИИ-генерация по описанию или под каждый текст\n"
+        "   • Загрузи одно фото или отдельные фото по слайдам\n"
         "   • Любой цвет или градиент\n"
         "4️⃣ Получи *ZIP* с PNG слайдами + *PDF*\n\n"
         "_Слайды: 1080×1350 px — вертикальный 4:5 формат для Instagram_",
@@ -728,7 +750,7 @@ async def cb_bg_type(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = u.callback_query
     await q.answer()
     s = sess(q.from_user.id)
-    t = q.data.split("_")[1]
+    t = q.data.removeprefix("bg_")
     s.bg_type = t
 
     if t == "template":
@@ -762,13 +784,24 @@ async def cb_bg_type(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             "• _минималистичная природа, зелёный_\n"
             "• _неоновый город в дождь_",
             parse_mode="Markdown",
+            reply_markup=kb([btn("✨ Подобрать фоны под текст", "ai_auto_bg")]),
         )
         return ENTER_BG_PROMPT
 
     elif t == "photo":
         await q.edit_message_text(
             "📸 Отправь фото для фона\n\n"
-            "_Будет автоматически подогнано под 1080×1080 px_",
+            "_Будет автоматически подогнано под 1080×1350 px_",
+            parse_mode="Markdown",
+        )
+        return WAIT_BG_PHOTO
+
+    elif t == "photo_each":
+        s.bg_photos = []
+        s.current_bg_slide = 0
+        await q.edit_message_text(
+            f"🧩 Отправь фото для *слайда 1/{s.slides_count}*\n\n"
+            "_Каждый фон будет подогнан под вертикальный формат 1080×1350 px_",
             parse_mode="Markdown",
         )
         return WAIT_BG_PHOTO
@@ -808,11 +841,44 @@ async def msg_bg_prompt(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     )
     return CONFIRM
 
+async def cb_ai_auto_bg(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = u.callback_query
+    await q.answer()
+    s = sess(q.from_user.id)
+    s.bg_type = "ai_auto"
+    s.bg_prompt = s.topic or (s.slide_texts[0] if s.slide_texts else "")
+    await q.edit_message_text(
+        "✅ Режим выбран: *ИИ подберёт отдельный фон под каждый слайд*.\n\n"
+        "Я сохраню общий стиль карусели, но картинки будут разными по смыслу каждого слайда.\n"
+        "Генерация может занять 1-3 минуты.",
+        parse_mode="Markdown",
+        reply_markup=kb([btn("🚀 Генерировать карусель!", "gen")]),
+    )
+    return CONFIRM
+
 async def msg_bg_photo(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     s = sess(u.effective_user.id)
     photo = u.message.photo[-1]
     f = await ctx.bot.get_file(photo.file_id)
-    s.bg_photo = bytes(await f.download_as_bytearray())
+    data = bytes(await f.download_as_bytearray())
+
+    if s.bg_type == "photo_each":
+        s.bg_photos.append(data)
+        s.current_bg_slide += 1
+        if s.current_bg_slide < s.slides_count:
+            await u.message.reply_text(
+                f"✅ Фото для слайда {s.current_bg_slide} получено.\n\n"
+                f"Теперь отправь фото для *слайда {s.current_bg_slide + 1}/{s.slides_count}*",
+                parse_mode="Markdown",
+            )
+            return WAIT_BG_PHOTO
+        await u.message.reply_text(
+            "✅ Все фото по слайдам получены! Готов к генерации.",
+            reply_markup=kb([btn("🚀 Генерировать карусель!", "gen")]),
+        )
+        return CONFIRM
+
+    s.bg_photo = data
     await u.message.reply_text(
         "✅ Фото получено! Готов к генерации.",
         reply_markup=kb([btn("🚀 Генерировать карусель!", "gen")]),
@@ -892,6 +958,12 @@ async def cb_gen(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         "⏳ *Генерирую карусель...*\n\n_Подожди 15–30 секунд_",
         parse_mode="Markdown",
     )
+    if s.bg_type == "ai_auto":
+        await q.edit_message_text(
+            "⏳ *Генерирую карусель...*\n\n"
+            "_Подбираю отдельный AI-фон под каждый слайд. Это может занять 1–3 минуты._",
+            parse_mode="Markdown",
+        )
     try:
         zip_bytes, pdf_bytes, preview_bytes = await build_carousel(s)
         ctx.user_data["zip"] = zip_bytes
@@ -1018,6 +1090,7 @@ def main():
                 CallbackQueryHandler(cb_template, pattern="^tpl_"),
             ],
             ENTER_BG_PROMPT: [
+                CallbackQueryHandler(cb_ai_auto_bg, pattern="^ai_auto_bg$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, msg_bg_prompt),
             ],
             WAIT_BG_PHOTO: [

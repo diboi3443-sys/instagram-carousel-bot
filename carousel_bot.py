@@ -25,12 +25,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── Конфигурация ─────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN      = os.getenv("TELEGRAM_TOKEN", "")
-OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
+def env_value(*names: str) -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value and value.strip():
+            return value.strip().strip('"').strip("'")
+    return ""
+
+def env_present(name: str) -> str:
+    value = os.getenv(name)
+    return "yes" if value and value.strip() else "no"
+
+TELEGRAM_TOKEN      = env_value("TELEGRAM_TOKEN", "BOT_TOKEN", "TELEGRAM_BOT_TOKEN")
+OPENROUTER_API_KEY  = env_value("OPENROUTER_API_KEY", "OPENAI_API_KEY")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-TEXT_MODEL          = os.getenv("TEXT_MODEL", "openai/gpt-4o-mini")
-IMAGE_MODEL         = os.getenv("IMAGE_MODEL", "google/gemini-2.5-flash-image")
-BOT_TITLE           = os.getenv("BOT_TITLE", "Carousel Bot")
+TEXT_MODEL          = env_value("TEXT_MODEL") or "openai/gpt-4o-mini"
+IMAGE_MODEL         = env_value("IMAGE_MODEL") or "google/gemini-2.5-flash-image"
+BOT_TITLE           = env_value("BOT_TITLE") or "Carousel Bot"
 
 SLIDE_W, SLIDE_H = 1080, 1080
 
@@ -904,6 +915,12 @@ async def cmd_cancel(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 def main():
     if not TELEGRAM_TOKEN:
+        logger.error(
+            "Telegram token env presence: TELEGRAM_TOKEN=%s BOT_TOKEN=%s TELEGRAM_BOT_TOKEN=%s",
+            env_present("TELEGRAM_TOKEN"),
+            env_present("BOT_TOKEN"),
+            env_present("TELEGRAM_BOT_TOKEN"),
+        )
         raise SystemExit("❌ Не задан TELEGRAM_TOKEN")
     if not OPENROUTER_API_KEY:
         logger.warning("OPENROUTER_API_KEY не задан: AI-текст и AI-фоны будут скрыты, ручной режим работает.")

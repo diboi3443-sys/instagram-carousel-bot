@@ -307,14 +307,14 @@ def style_conf(key: str) -> dict:
 
 def panel_fill(panel_type: str, first: bool) -> tuple:
     if panel_type == "light":
-        return (255, 255, 255, 232)
+        return (255, 255, 255, 176)
     if panel_type == "frosted":
-        return (255, 255, 255, 205)
+        return (255, 255, 255, 148)
     if panel_type == "minimal":
-        return (255, 255, 255, 0) if first else (255, 255, 255, 226)
+        return (255, 255, 255, 0) if first else (255, 255, 255, 166)
     if panel_type == "solid_dark":
-        return (0, 0, 0, 210)
-    return (0, 0, 0, 132) if first else (255, 255, 255, 218)
+        return (0, 0, 0, 158)
+    return (0, 0, 0, 96) if first else (255, 255, 255, 166)
 
 def text_palette(panel_type: str, first: bool):
     if panel_type in ("light", "frosted") or (panel_type == "minimal" and not first):
@@ -496,8 +496,9 @@ async def ai_generate_bg(prompt: str) -> Optional[bytes]:
 
     full = (
         f"Full-bleed vertical 4:5 abstract editorial background for an Instagram carousel, {prompt}, "
-        "no text, no typography, no frames, no borders, no mockup, no poster inside poster, "
-        "clean edges, rich depth, enough negative space for text, high-end social media design"
+        "NO text, NO letters, NO words, NO numbers, NO symbols, NO logos, NO typography, "
+        "NO captions, NO labels, NO UI, no frames, no borders, no mockup, no poster inside poster, "
+        "clean edges, rich depth, enough negative space for overlay text, high-end social media design"
     )
     try:
         r = await _or_client().chat.completions.create(
@@ -529,12 +530,46 @@ async def ai_generate_bg(prompt: str) -> Optional[bytes]:
         logger.warning(f"AI фон не получился: {e}")
     return None
 
-def slide_bg_prompt(s: Session, text: str, index: int, total: int) -> str:
+async def ai_generate_visual_prompts(s: Session) -> list[str]:
+    if not has_ai():
+        return []
+
+    slides = "\n".join(f"{i+1}. {text}" for i, text in enumerate(s.slide_texts))
+    prompt = (
+        "Ты арт-директор Instagram-каруселей. По текстам слайдов придумай визуальные промпты для фонов.\n"
+        "Важно: изображения НЕ должны содержать текст, буквы, цифры, вывески, интерфейсы, логотипы или типографику.\n"
+        "Не копируй текст слайдов в промпты. Передавай смысл только через визуальные метафоры, объекты, свет, цвет и композицию.\n"
+        "Все промпты должны быть в едином премиальном стиле, но с разными композициями по слайдам.\n\n"
+        f"Тема карусели: {s.topic or (s.slide_texts[0] if s.slide_texts else 'Instagram carousel')}\n"
+        f"Тексты слайдов:\n{slides}\n\n"
+        f'Ответь ТОЛЬКО JSON: {{"prompts": ["...", "..."]}}. Нужны ровно {len(s.slide_texts)} промптов. '
+        "Пиши промпты на английском."
+    )
+    try:
+        r = await _or_client().chat.completions.create(
+            model=TEXT_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.65,
+            max_tokens=900,
+            extra_headers={"HTTP-Referer": "https://t.me/carousel_bot", "X-Title": BOT_TITLE},
+        )
+        raw = r.choices[0].message.content or ""
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if m:
+            data = json.loads(m.group())
+            prompts = [str(x).strip() for x in data.get("prompts", []) if str(x).strip()]
+            return prompts[: len(s.slide_texts)]
+    except Exception as e:
+        logger.warning("Не удалось подготовить visual prompts: %s", e)
+    return []
+
+def slide_bg_prompt(s: Session, index: int, total: int) -> str:
     topic = s.topic or (s.slide_texts[0] if s.slide_texts else "Instagram carousel")
+    role = "cover hook" if index == 1 else "call to action finale" if index == total else "educational insight"
     return (
-        f"visual theme: {topic}; slide {index} of {total}; slide meaning: {text}; "
+        f"visual theme: {topic}; slide {index} of {total}; role: {role}; "
         "keep a coherent premium editorial style across the carousel, use related colors, "
-        "different composition for this slide, abstract/metaphorical visual, no text"
+        "different composition for this slide, abstract/metaphorical visual, no text, no letters"
     )
 
 # ─── Сборка карусели ──────────────────────────────────────────────────────────
@@ -554,8 +589,10 @@ async def build_carousel(s: Session) -> tuple[bytes, bytes, bytes]:
             logger.warning("AI фон недоступен, использую уникальный градиент")
     elif s.bg_type == "ai_auto":
         c1, c2 = seeded_palette(" ".join(s.slide_texts) or s.topic)
+        visual_prompts = await ai_generate_visual_prompts(s)
         for i, text in enumerate(s.slide_texts):
-            data = await ai_generate_bg(slide_bg_prompt(s, text, i + 1, len(s.slide_texts)))
+            prompt = visual_prompts[i] if i < len(visual_prompts) else slide_bg_prompt(s, i + 1, len(s.slide_texts))
+            data = await ai_generate_bg(prompt)
             slide_bg_imgs.append(Image.open(io.BytesIO(data)) if data else None)
         if not any(slide_bg_imgs):
             logger.warning("AI-фоны по слайдам недоступны, использую единый градиент")
